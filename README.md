@@ -18,19 +18,23 @@ An AI-powered lead intelligence platform that automatically researches companies
 │  │  Agent   │  │    Agent     │  │  Writer   │  │
 │  └──────────┘  └──────────────┘  └───────────┘  │
 │       ↓              ↓                ↓          │
-│   DuckDuckGo    4-Step Multi      Groq LLM      │
-│   + Scraping    Source Search     (Llama 3.3)    │
+│   DuckDuckGo    7-Step Pipeline   Groq LLM      │
+│   + Scraping    Snippet→Scrape→   (Llama 3.3)   │
+│                 Score→LLM         Last Resort   │
 └──────────────────────────────────────────────────┘
 ```
 
 ## ✨ Core Features
 
 - **Researcher Agent** 🕵️‍♂️ — intelligently searches the web, scrapes multiple highly-relevant sources, and builds deeply curated profiles via LLM.
-- **Contact Finder Agent** 📞 — A highly optimized 4-step discovery strategy: 
-  1. Deep regex scanning on site
-  2. Targeted DDG "contact info" domain sweeping
-  3. Context-aware `/contact` page parsing
-  4. LLM-based fallback extraction
+- **Contact Finder Agent** 📞 — Deterministic-first, 7-step pipeline that minimises LLM usage:
+  1. **Cache check** — returns instantly if company was already processed
+  2. **DDG snippet regex** — runs regex on search snippets immediately (no scraping needed for most companies)
+  3. **Link ranking** — scores URLs by domain (`justdial`/`indiamart` = +5, `wikipedia` = -5) using `urlparse().netloc` to avoid false matches
+  4. **Targeted scraping** — scrapes only the top 4 ranked links + runs regex
+  5. **Confidence scoring** — every result scored (phone +5, email +5, directory source +3); best picked
+  6. **`/contact` page fallback** — tries `/contact`, `/contact-us`, `/about` on the official domain if still incomplete
+  7. **LLM fallback** — called ONCE only if all above steps fail
 - **Outreach Writer Agent** ✍️ — Generates engaging and natural WhatsApp-style outreach messages personalized to the extracted data.
 - **Parallel Batch Processing** ⚡ — Blazing fast ingestion of multiple companies concurrently mapped via `asyncio.gather`.
 - **Excel Batch Upload** 📊 — Directly upload `.xlsx` spreadsheets to process 10s-100s of companies seamlessly.

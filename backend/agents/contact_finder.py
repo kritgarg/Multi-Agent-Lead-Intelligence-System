@@ -1,239 +1,325 @@
 import re
 import json
 import asyncio
+from urllib.parse import urlparse
 from utils.scraper import scrape_url
 from utils.llm import ask_llm
 
-EMAIL_PATTERN = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+# ─── In-memory cache to avoid reprocessing same company ───────────────────────
+_cache: dict = {}
 
-PHONE_PATTERNS = [
-    r'\+?\d{1,3}[-.\s]?\(?\d{2,5}\)?[-.\s]?\d{3,5}[-.\s]?\d{3,5}',
-    r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',
-    r'\+\d{10,13}',
-]
+# ─── Regex Patterns ───────────────────────────────────────────────────────────
+PHONE_REGEX = r'(\+91[\-\s]?)?[6-9]\d{9}'
+EMAIL_REGEX = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.(com|in|org|net|co\.in)'
 
-BAD_EMAIL_ENDINGS = ['.png', '.jpg', '.jpeg', '.svg', '.gif', '.webp', '.css', '.js']
-BAD_EMAIL_DOMAINS = ['example.com', 'sentry.io', 'wixpress.com', 'w3.org', 'schema.org', 'googleapis.com']
+# Emails/domains to discard as garbage
+_BAD_EMAIL_KEYWORDS = ['example', 'test', 'sentry', 'noreply', 'no-reply', 'donotreply']
+_BAD_EMAIL_EXTS     = ['.png', '.jpg', '.jpeg', '.svg', '.gif', '.webp', '.css', '.js']
+_BAD_EMAIL_DOMAINS  = ['sentry.io', 'wixpress.com', 'w3.org', 'schema.org', 'googleapis.com']
 
-
-def _extract_emails(text: str) -> list:
-    emails = re.findall(EMAIL_PATTERN, text)
-    valid = []
-    for email in emails:
-        email_lower = email.lower()
-        if any(email_lower.endswith(ext) for ext in BAD_EMAIL_ENDINGS):
-            continue
-        if any(domain in email_lower for domain in BAD_EMAIL_DOMAINS):
-            continue
-        if len(email) < 6:
-            continue
-        valid.append(email)
-    return valid
+# ─── Link ranking weights ─────────────────────────────────────────────────────
+_DIRECTORY_DOMAINS = ['justdial', 'indiamart', 'sulekha', 'yellowpages', 'mouthshut', 'tradeindia']
+_SKIP_DOMAINS      = ['linkedin.com', 'wikipedia.org', 'facebook.com', 'twitter.com',
+                      'instagram.com', 'youtube.com', 'glassdoor.com', 'ambitionbox.com']
 
 
-def _extract_phones(text: str) -> list:
-    phones = []
-    for pattern in PHONE_PATTERNS:
-        matches = re.findall(pattern, text)
-        phones.extend(matches)
-    valid = []
-    for phone in phones:
-        digits_only = re.sub(r'\D', '', phone)
-        if len(digits_only) >= 10:
-            valid.append(phone)
-    return valid
+# ─── STEP 1: Multi-query search ───────────────────────────────────────────────
+def get_search_links(company: str) -> tuple:
+    """Run targeted queries. Returns (links, snippet_text)."""
+    from ddgs import DDGS
 
-
-def _get_company_domain(links: list) -> str:
-    skip_domains = [
-        'wikipedia.org', 'linkedin.com', 'facebook.com', 'twitter.com',
-        'youtube.com', 'instagram.com', 'ambitionbox.com', 'glassdoor.com',
-        'justdial.com', 'indiamart.com', 'crunchbase.com', 'github.com',
-        'cleartax.in', 'zaubacorp.com', 'tofler.in'
+    queries = [
+        f"{company} contact email phone",
+        f"{company} justdial indiamart contact",
     ]
-    for link in links:
-        link_lower = link.lower()
-        if any(domain in link_lower for domain in skip_domains):
+
+    seen = set()
+    links = []
+    snippets = []
+
+    for query in queries:
+        try:
+            # Limit to 4 results per query to keep it fast
+            results = list(DDGS().text(query, max_results=4))
+            for r in results:
+                url = r.get("href", "").strip()
+                body = r.get("body", "")
+                if url and url not in seen:
+                    seen.add(url)
+                    links.append(url)
+                if body:
+                    snippets.append(body)
+        except Exception as e:
+            print(f"   ⚠️  DDG query failed [{query[:40]}]: {e}")
+
+    snippet_text = " ".join(snippets)
+    print(f"   📎 Collected {len(links)} unique links, {len(snippet_text)} chars of snippets")
+    return links, snippet_text
+
+
+# ─── STEP 2: Link ranking ─────────────────────────────────────────────────────
+def rank_links(links: list, company_domain: str = "") -> list:
+    """Score and sort links using netloc (domain) not full URL to avoid false matches."""
+
+    def get_netloc(url: str) -> str:
+        try:
+            return urlparse(url).netloc.lower()
+        except Exception:
+            return url.lower()
+
+    def score(url: str) -> int:
+        netloc = get_netloc(url)
+        s = 0
+        # Score by actual domain, not full URL path (fixes quora.com/...justdial... bug)
+        if any(netloc == d or netloc.endswith("." + d) for d in _DIRECTORY_DOMAINS): s += 5
+        if company_domain and company_domain in netloc:                               s += 5
+        if url.startswith("https://"):                                                s += 1
+        if ".com" in netloc or ".in" in netloc:                                       s += 2
+        if "linkedin.com" in netloc:                                                  s -= 3
+        if "wikipedia.org" in netloc:                                                 s -= 5
+        if any(d in netloc for d in ['quora.com','facebook.','twitter.','instagram.','youtube.']): s -= 4
+        return s
+
+    ranked = sorted(links, key=score, reverse=True)
+    print(f"   🏆 Top link after ranking: {ranked[0] if ranked else 'none'}")
+    return ranked
+
+
+# ─── STEP 3: Strong regex extraction ──────────────────────────────────────────
+def extract_contacts(text: str) -> dict:
+    """Extract best phone + email from text using strict patterns."""
+    # Phones
+    phones = re.findall(PHONE_REGEX, text)
+    clean_phones = []
+    for match in phones:
+        # re.findall returns tuples when groups exist — flatten
+        full = match if isinstance(match, str) else "".join(match)
+        digits = re.sub(r'\D', '', full)
+        if len(digits) >= 10 and full not in clean_phones:
+            clean_phones.append(full.strip())
+
+    # Rebuild phone from raw text to get full match (group issue workaround)
+    raw_phones = re.findall(r'(\+91[\-\s]?[6-9]\d{9}|[6-9]\d{9})', text)
+    raw_phones = list(dict.fromkeys(raw_phones))  # deduplicate preserving order
+
+    # Emails
+    raw_emails = re.findall(EMAIL_REGEX, text, re.IGNORECASE)
+    # re returns tuples for groups — rebuild from full pattern
+    all_emails = re.findall(
+        r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.(com|in|org|net|co\.in)',
+        text, re.IGNORECASE
+    )
+    # Reconstruct full email strings
+    clean_emails = []
+    for match in re.finditer(
+        r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.(com|in|org|net|co\.in)',
+        text, re.IGNORECASE
+    ):
+        email = match.group(0).lower()
+        if any(email.endswith(ext) for ext in _BAD_EMAIL_EXTS):       continue
+        if any(kw in email for kw in _BAD_EMAIL_KEYWORDS):            continue
+        if any(domain in email for domain in _BAD_EMAIL_DOMAINS):     continue
+        if len(email) < 6:                                            continue
+        if email not in clean_emails:
+            clean_emails.append(email)
+
+    return {
+        "phone": raw_phones[0] if raw_phones else None,
+        "email": clean_emails[0] if clean_emails else None,
+    }
+
+
+# ─── STEP 4: Confidence scoring ───────────────────────────────────────────────
+def score_contact(contact: dict, source: str) -> int:
+    """Score a contact result for ranking."""
+    s = 0
+    if contact.get("phone"): s += 5
+    if contact.get("email"): s += 5
+    src = source.lower()
+    if any(d in src for d in _DIRECTORY_DOMAINS): s += 3
+    # Penalise low-quality sources
+    if "wikipedia" in src or "linkedin" in src:   s -= 4
+    return s
+
+
+# ─── STEP 5: /contact page scraper ───────────────────────────────────────────
+async def try_contact_pages(domain: str) -> list:
+    """Scrape common contact-page paths and return a list of contact dicts."""
+    paths = ["/contact", "/contact-us", "/contactus", "/about", "/reach-us"]
+    results = []
+
+    for path in paths:
+        url = domain + path
+        print(f"      🌐 Trying contact page: {url}")
+        text = await asyncio.to_thread(scrape_url, url)
+        if not text:
+            continue
+        contacts = extract_contacts(text)
+        if contacts["phone"] or contacts["email"]:
+            results.append({**contacts, "source": url})
+            if contacts["phone"] and contacts["email"]:
+                break  # Both found — no need to continue
+
+    return results
+
+
+# ─── STEP 6: LLM fallback ─────────────────────────────────────────────────────
+async def llm_extract(text: str, company: str) -> dict:
+    """Ask the LLM to extract contacts from concatenated scraped text."""
+    snippet = text[-3000:] if len(text) > 3000 else text
+    if not snippet.strip():
+        return {"phone": None, "email": None}
+
+    prompt = f"""You are extracting contact information for the company "{company}".
+
+Text from their website and directories is below.
+Extract ONE valid business phone number and ONE valid business email.
+
+Rules:
+- Return ONLY valid JSON: {{"email": "...", "phone": "..."}}
+- Phone must be a real Indian mobile or landline (10 digits).
+- Ignore fake/system emails (noreply, sentry, example, test).
+- If a field is not found, use null (not a string).
+- Do NOT make up any contact info.
+
+--- TEXT ---
+{snippet}
+--- END ---"""
+
+    raw = await ask_llm(prompt)
+
+    try:
+        s = raw.strip()
+        if "```json" in s: s = s.split("```json")[1].split("```")[0].strip()
+        elif "```" in s:   s = s.split("```")[1].split("```")[0].strip()
+        start, end = s.find("{"), s.rfind("}") + 1
+        if start != -1 and end > start:
+            data = json.loads(s[start:end])
+            return {
+                "phone": data.get("phone") or None,
+                "email": (data.get("email") or "").lower() or None,
+            }
+    except Exception as e:
+        print(f"      ⚠️  LLM JSON parse failed: {e}")
+
+    return {"phone": None, "email": None}
+
+
+# ─── HELPER: detect official domain ──────────────────────────────────────────
+def _detect_official_domain(links: list) -> str:
+    for url in links:
+        low = url.lower()
+        if any(d in low for d in _SKIP_DOMAINS + _DIRECTORY_DOMAINS):
             continue
         try:
-            from urllib.parse import urlparse
-            parsed = urlparse(link)
-            base_url = f"{parsed.scheme}://{parsed.netloc}"
-            return base_url
-        except:
+            parsed = urlparse(url)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
             pass
     return ""
 
 
+# ─── MAIN AGENT ───────────────────────────────────────────────────────────────
 async def contact_agent(scraped_text: str, links: list, company: str) -> dict:
     print(f"\n{'='*50}")
     print(f"📞 CONTACT FINDER AGENT: Finding contacts for '{company}'")
     print(f"{'='*50}")
 
-    found_email = None
-    found_phone = None
-    contact_source = links[0] if links else "Not Available"
-    all_text_collected = scraped_text or ""
+    # Cache check
+    cache_key = company.lower().strip()
+    if cache_key in _cache:
+        print(f"   ✅ Cache hit for '{company}'")
+        return _cache[cache_key]
 
-    print("   📋 Step 1: Checking researcher's scraped text with regex...")
+    all_results: list[dict] = []
+    collected_text = scraped_text or ""
 
+    # ── Step 1 & 2: Multi-query search + rank ─────────────────────────────────
+    print("   🔎 Step 1-2: Running multi-query search and ranking links...")
+    official_domain = _detect_official_domain(links)
+    search_links, search_snippets = await asyncio.to_thread(get_search_links, company)
+
+    # Immediately try regex on search snippets — free, fast, no extra scraping
+    if search_snippets:
+        collected_text += "\n" + search_snippets
+        snippet_contacts = extract_contacts(search_snippets)
+        if snippet_contacts["phone"] or snippet_contacts["email"]:
+            score = score_contact(snippet_contacts, "search_snippet")
+            all_results.append({**snippet_contacts, "source": "search_snippet", "score": score})
+            print(f"      ✅ Found contacts in search snippets (no scraping needed!)")
+
+    all_links = list(dict.fromkeys(links + search_links))  # merge, deduplicate
+    ranked    = rank_links(all_links, official_domain)
+
+    # ── Step 3 & 4: Scrape top sources + regex ────────────────────────────────
+    print("   🌐 Step 3-4: Scraping top ranked sources...")
+    for url in ranked[:4]:
+        text = await asyncio.to_thread(scrape_url, url)
+        if not text:
+            continue
+        collected_text += "\n" + text
+        contacts = extract_contacts(text)
+        if contacts["phone"] or contacts["email"]:
+            score = score_contact(contacts, url)
+            all_results.append({**contacts, "source": url, "score": score})
+            print(f"      ✅ Extracted from {url} (score: {score})")
+
+    # Also try regex on the original researcher text
     if scraped_text:
-        emails = _extract_emails(scraped_text)
-        phones = _extract_phones(scraped_text)
-        if emails:
-            found_email = emails[0]
-            print(f"      ✅ Found email: {found_email}")
-        if phones:
-            found_phone = phones[0]
-            print(f"      ✅ Found phone: {found_phone}")
+        contacts = extract_contacts(scraped_text)
+        if contacts["phone"] or contacts["email"]:
+            score = score_contact(contacts, ranked[0] if ranked else "")
+            all_results.append({**contacts, "source": "researcher_text", "score": score})
 
-    if not found_email or not found_phone:
-        print("      ❌ Incomplete — moving to Step 2")
+    # ── Step 5: Score and pick best so far ───────────────────────────────────
+    all_results.sort(key=lambda x: x["score"], reverse=True)
+    best = all_results[0] if all_results else {"phone": None, "email": None, "source": ""}
 
-    if not found_email or not found_phone:
-        print("   🔍 Step 2: Searching DDG specifically for contact info...")
-        try:
-            from ddgs import DDGS
-            contact_query = f'"{company}" contact email phone number'
-            results = await asyncio.to_thread(
-                lambda: DDGS().text(contact_query, max_results=5)
-            )
+    # ── Step 6: /contact page fallback ───────────────────────────────────────
+    if not best.get("phone") or not best.get("email"):
+        if official_domain:
+            print("   🏠 Step 6: Trying /contact pages on official domain...")
+            contact_page_results = await try_contact_pages(official_domain)
+            for r in contact_page_results:
+                r["score"] = score_contact(r, r["source"]) + 2  # bonus for contact page
+                all_results.append(r)
+                collected_text += "\n" + r.get("source", "")
 
-            contact_snippets = []
-            for r in results:
-                snippet = f"{r.get('title', '')} {r.get('body', '')}"
-                contact_snippets.append(snippet)
+            all_results.sort(key=lambda x: x["score"], reverse=True)
+            best = all_results[0] if all_results else best
 
-                url = r.get("href", "")
-                if any(d in url.lower() for d in ["justdial", "indiamart", "sulekha", "yellowpages", "mouthshut"]):
-                    print(f"      📂 Found directory listing: {url}")
-                    directory_text = await asyncio.to_thread(scrape_url, url)
-                    if directory_text:
-                        contact_snippets.append(directory_text)
-                        contact_source = url
+    # ── Step 7: LLM fallback (ONCE, only if still missing data) ──────────────
+    if not best.get("phone") or not best.get("email"):
+        print("   🤖 Step 7: LLM fallback — extracting from collected text...")
+        llm_data = await llm_extract(collected_text, company)
 
-            snippet_text = " ".join(contact_snippets)
-            all_text_collected += "\n" + snippet_text
+        if not best.get("phone") and llm_data.get("phone"):
+            best["phone"] = llm_data["phone"]
+            print(f"      ✅ LLM found phone: {llm_data['phone']}")
 
-            if not found_email:
-                emails = _extract_emails(snippet_text)
-                if emails:
-                    found_email = emails[0]
-                    print(f"      ✅ Found email from search: {found_email}")
+        if not best.get("email") and llm_data.get("email"):
+            best["email"] = llm_data["email"]
+            print(f"      ✅ LLM found email: {llm_data['email']}")
 
-            if not found_phone:
-                phones = _extract_phones(snippet_text)
-                if phones:
-                    found_phone = phones[0]
-                    print(f"      ✅ Found phone from search: {found_phone}")
+    # ── Build final output ────────────────────────────────────────────────────
+    phone  = best.get("phone") or "Not Available"
+    email  = best.get("email") or "Not Available"
+    source = best.get("source") or (ranked[0] if ranked else "Not Available")
 
-        except Exception as e:
-            print(f"      ⚠️  Contact search failed: {e}")
-
-    if not found_email or not found_phone:
-        print("      ❌ Still incomplete — moving to Step 3")
-
-    if not found_email or not found_phone:
-        print("   🌐 Step 3: Trying to scrape company's contact page...")
-        company_domain = _get_company_domain(links)
-
-        if company_domain:
-            contact_paths = ["/contact", "/contact-us", "/contactus", "/about/contact", "/reach-us"]
-
-            for path in contact_paths:
-                contact_url = company_domain + path
-                print(f"      Trying: {contact_url}")
-
-                contact_page_text = await asyncio.to_thread(scrape_url, contact_url)
-
-                if contact_page_text:
-                    all_text_collected += "\n" + contact_page_text
-                    contact_source = contact_url
-
-                    if not found_email:
-                        emails = _extract_emails(contact_page_text)
-                        if emails:
-                            found_email = emails[0]
-                            print(f"      ✅ Found email on contact page: {found_email}")
-
-                    if not found_phone:
-                        phones = _extract_phones(contact_page_text)
-                        if phones:
-                            found_phone = phones[0]
-                            print(f"      ✅ Found phone on contact page: {found_phone}")
-
-                    if found_email and found_phone:
-                        break
-        else:
-            print("      ⚠️  Could not determine company domain")
-
-    if not found_email or not found_phone:
-        print("      ❌ Still incomplete — moving to Step 4 (LLM)")
-
-    if not found_email or not found_phone:
-        print("   🤖 Step 4: Asking LLM to extract contacts from all text...")
-
-        llm_text = all_text_collected[-3000:] if len(all_text_collected) > 3000 else all_text_collected
-
-        if llm_text.strip():
-            prompt = f"""You are extracting contact information for the company "{company}".
-
-Below is text from their website, search results, and directory listings.
-Find the BEST contact email and phone number for this company.
-
-Rules:
-- Return ONLY a valid JSON object, nothing else
-- Format: {{"email": "...", "phone": "...", "whatsapp": "..."}}
-- For phone, include country code if available (e.g. +91...)
-- If a field is truly not found anywhere, use "Not Available"
-- Prefer business/sales/info emails over personal ones
-- Do NOT make up contacts, only extract what's actually in the text
-
---- TEXT ---
-{llm_text}
---- END ---"""
-
-            llm_response = await ask_llm(prompt)
-
-            try:
-                json_str = llm_response.strip()
-                if "```json" in json_str:
-                    json_str = json_str.split("```json")[1].split("```")[0].strip()
-                elif "```" in json_str:
-                    json_str = json_str.split("```")[1].split("```")[0].strip()
-
-                start = json_str.find("{")
-                end = json_str.rfind("}") + 1
-                if start != -1 and end > start:
-                    json_str = json_str[start:end]
-
-                data = json.loads(json_str)
-
-                if not found_email and data.get("email") and data["email"] != "Not Available":
-                    found_email = data["email"]
-                    print(f"      ✅ LLM found email: {found_email}")
-
-                if not found_phone and data.get("phone") and data["phone"] != "Not Available":
-                    found_phone = data["phone"]
-                    print(f"      ✅ LLM found phone: {found_phone}")
-
-            except (json.JSONDecodeError, Exception) as e:
-                print(f"      ⚠️  Could not parse LLM response: {e}")
-
-    contact_info = {
-        "email": found_email if found_email else "Not Available",
-        "phone": found_phone if found_phone else "Not Available",
-        "whatsapp": "Not Available",
-        "source": contact_source
+    result = {
+        "phone":    phone,
+        "email":    email,
+        "whatsapp": phone if phone != "Not Available" else "Not Available",
+        "source":   source,
     }
 
-    if found_phone:
-        contact_info["whatsapp"] = found_phone
-
     print(f"\n   📋 FINAL CONTACT INFO:")
-    print(f"      Email:    {contact_info['email']}")
-    print(f"      Phone:    {contact_info['phone']}")
-    print(f"      WhatsApp: {contact_info['whatsapp']}")
-    print(f"      Source:   {contact_info['source']}")
+    print(f"      Email:    {result['email']}")
+    print(f"      Phone:    {result['phone']}")
+    print(f"      WhatsApp: {result['whatsapp']}")
+    print(f"      Source:   {result['source']}")
 
-    return contact_info
+    # Cache result
+    _cache[cache_key] = result
+    return result
