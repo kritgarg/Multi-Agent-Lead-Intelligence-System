@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+requests
+beautifulsoup4
+pandas
+python-dotenv
+googlesearch-python
+groq
+python-multipart
+openpyxl
+ddgs
